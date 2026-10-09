@@ -1,0 +1,801 @@
+---
+title: "Inside the Current Horror Boom: Themes, Audience Ratings and Actors in 2022-2026 Films"
+subtitle: "COMP3020 Social Web Analytics: Group Project Report"
+author: Group 8
+date: "October 2026"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: false
+    number_sections: true
+    fig_caption: true
+geometry: margin=2cm
+fontsize: 11pt
+header-includes:
+  - \usepackage{float}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      comment = "##", fig.align = "center",
+                      dev = "png", dpi = 150, fig.pos = "H")
+knitr::opts_hooks$set(fig.width = function(options) {
+  options$out.width = paste0(min(options$fig.width, 6.7), "in")
+  options
+})
+options(width = 85)
+```
+
+| Group member     | Student ID | Contribution |
+|:-----------------|:-----------|-------------:|
+| Minh Duc Nguyen  | 22153839   | 34%        |
+| Quang Huy Nguyen | 22097631   | 33%        |
+| Phuong Thao Phi  | 22192468   | 33%        |
+
+**Data and code repository:** [https://github.com/quanghuynguyen2502ctls-alt/horror-boom](https://github.com/quanghuynguyen2502ctls-alt/horror-boom)
+
+This product uses the TMDB API but is not endorsed or certified by TMDB.
+
+\tableofcontents
+\newpage
+
+```{r packages}
+library(tm)            # corpus, document-term matrix (Module 4)
+library(SnowballC)     # Porter stemming (Module 4)
+library(wordcloud)     # word clouds (Module 5)
+library(RColorBrewer)  # colour palettes
+library(dplyr)         # data manipulation
+library(igraph)        # network analysis (Modules 7 and 8)
+
+# Helper functions for formatting numbers in the text
+fmt = function(x, d = 0) format(round(x, d), big.mark = ",", nsmall = d)
+pct = function(x, d = 1) paste0(format(round(100 * x, d), nsmall = d), "%")
+pval = function(p) ifelse(p < 0.001, "p < 0.001", paste0("p = ", format(round(p, 3), nsmall = 3)))
+```
+
+# Introduction
+
+Recent years are often described as a horror boom. This report first checks that claim with TMDb data, then asks what the current boom actually looks like. We cannot observe why audiences choose to be scared, but we can describe what recent horror films talk about, how audiences rate them, and who appears in them.
+
+Prior work has grouped film plot summaries into themes (Matthews & Glitre, 2021) and found that plot text only modestly predicts audience ratings (Lee et al., 2020). Actor co-appearance networks are a classic example of social networks with a few highly connected hubs (Barabási & Albert, 1999) and short paths between actors (Watts & Strogatz, 1998). We combine these perspectives in one investigation of horror films released between January 2022 and June 2026.
+
+# Research questions
+
+**Main research question:** What characterises horror films released between January 2022 and June 2026 in terms of their language, audience reception, narrative themes and actor network?
+
+* **RQ1 (text analysis):** How does the language of recent horror film overviews differ from that of non-horror films (Action, Romance, Animation)?
+* **RQ2 (hypothesis testing):** Is genre group (horror vs non-horror) associated with audience rating band?
+* **RQ3 (clustering):** What distinct narrative themes emerge within recent horror films?
+* **RQ4 (network analysis):** Which actors occupy the most central positions in the recent horror co-appearance network, and is the network driven by a small group of recurring actors?
+
+The questions build on each other. RQ1 shows that horror has a distinct vocabulary, which motivates looking for sub-themes within horror (RQ3). The themes from RQ3 are then linked back to audience ratings (RQ2) and used to describe the actors in the network (RQ4). Before the four questions, we check whether a horror "boom" exists at all.
+
+
+# Data Collection
+
+## Data accessed and obtained
+
+Data was collected from the Movie Database (TMDb) API using R on 5 October 2026. The principal R package used for API access was `httr2`, while `dplyr` was used for data manipulation and duplicate checking. Access requires a free API Read Access Token, which we stored outside the code in `.Renviron`. This report chose TMDb as the data source because it is a single structured online database that contains movie metadata, audience ratings, and cast information. All these types of information provided by TMDb are useful for this report, for example, textual film overview for text analysis and clustering, audience vote information for hypothesis testing, and cast credits for network analysis.
+
+The study investigates whether the current horror boom reflects distinctive stories. Therefore, we focus on the current horror films that were released between 1 January 2022 and 30 June 2026. The end point June 2026 was chosen because it gave every film at least three months before data collection to accumulate audience ratings and popularity data; therefore, it reduced the instability when getting data from very recent releases from months such as September. This fixed period of time allows us to compare horror and non-horror films under similar market conditions rather than collecting widely scattered data from substantially different periods. To ensure that audience-rating measures were not based on extremely sparse user feedback, only films with at least 20 TMDb votes were retrieved. English-language metadata were requested because the subsequent text analyses require film overviews in a common language. Adult-content records were excluded from the sampling frame. The table below summarises the parameters that are used to define the sample when querying the TMDb API:
+
+| Parameters | Setting |
+|:--|:--|
+| `primary_release_date.gte` | 2022-01-01 |
+| `primary_release_date.lte` | 2026-06-30 |
+| `vote_count.gte` | 20 |
+| `language` | en-US |
+| `include_adult` | false |
+
+This report defined comparison groups directly through TMDb genre IDs: horror films with genre ID 27 and other non-horror films such as Action (28), Romance (10749), or Animation (16). Non-horror films must **not** have the Horror genre, so the two groups never overlap. These three genres were specified as non-horror films as they offer broad contrasting forms of mainstream storytelling while keeping the comparison sample manageable and interpretable for research questions RQ1 and RQ2. For context, we also counted horror and total films per year from 2015 to 2026 with the same vote filter.
+
+The collection code is shown below but not re-run when this report is knitted, because TMDb data changes over time. The full scripts (`01_collect.R`, `02_cast.R`, `03_clean.R`) are in the repository.
+
+```{r collection, eval=FALSE}
+library(httr2)
+token = Sys.getenv("TMDB_TOKEN")
+
+# One page (20 films) from the discover endpoint
+get_page = function(page, with_genres, without_genres = NULL) {
+  req = request("https://api.themoviedb.org/3/discover/movie") |>
+    req_auth_bearer_token(token) |>
+    req_url_query(with_genres = with_genres,
+                  `primary_release_date.gte` = "2022-01-01",
+                  `primary_release_date.lte` = "2026-06-30",
+                  `vote_count.gte` = 20, include_adult = "false",
+                  language = "en-US",
+                  sort_by = "primary_release_date.asc",  # stable paging order
+                  page = page)
+  if (!is.null(without_genres))
+    req = req |> req_url_query(without_genres = without_genres)
+  res = req |> req_perform() |> resp_body_json()
+  Sys.sleep(0.1)                                         # respect rate limit
+  films = lapply(res$results, function(m) data.frame(
+    id = m$id, title = m$title, overview = m$overview,
+    genre_ids = paste(unlist(m$genre_ids), collapse = ","),
+    vote_average = m$vote_average, vote_count = m$vote_count,
+    popularity = m$popularity, release_date = m$release_date,
+    original_language = m$original_language))
+  list(films = do.call(rbind, films), total_pages = res$total_pages)
+}
+
+# Loop over all pages (pagination)
+get_all = function(with_genres, without_genres = NULL) {
+  first = get_page(1, with_genres, without_genres)
+  stopifnot(first$total_pages <= 500)
+  pages = list(first$films)
+  if (first$total_pages > 1)
+    for (p in 2:first$total_pages)
+      pages[[p]] = get_page(p, with_genres, without_genres)$films
+  do.call(rbind, pages)
+}
+
+horror_raw = get_all("27")
+nonhorror_raw = get_all("28|10749|16", without_genres = "27")
+horror_raw = distinct(horror_raw, id, .keep_all = TRUE)        # drop repeated IDs across pages
+nonhorror_raw = distinct(nonhorror_raw, id, .keep_all = TRUE)
+
+# Top 15 billed cast for one film
+get_cast = function(movie_id, n_cast = 15) {
+  res = request(paste0("https://api.themoviedb.org/3/movie/",
+                       movie_id, "/credits")) |>
+    req_auth_bearer_token(token) |> req_retry(max_tries = 3) |>
+    req_perform() |> resp_body_json()
+  Sys.sleep(0.1)
+  cast = res$cast
+  if (length(cast) == 0) return(NULL)
+  cast = cast[order(sapply(cast, function(a) a$order))]
+  cast = cast[1:min(n_cast, length(cast))]
+  do.call(rbind, lapply(cast, function(a) data.frame(
+    film_id = movie_id, actor_id = a$id, actor_name = a$name,
+    cast_order = a$order,
+    character = ifelse(is.null(a$character), "", a$character))))
+}
+cast_raw = do.call(rbind, lapply(horror_raw$id, get_cast))
+
+count_films = function(year, with_genres = NULL) {
+  end = ifelse(year == 2026, "-06-30", "-12-31")
+  req = request("https://api.themoviedb.org/3/discover/movie") |>
+    req_auth_bearer_token(token) |>
+    req_url_query(`primary_release_date.gte` = paste0(year, "-01-01"),
+                  `primary_release_date.lte` = paste0(year, end),
+                  `vote_count.gte` = 20, include_adult = "false", page = 1)
+  if (!is.null(with_genres)) req = req |> req_url_query(with_genres = with_genres)
+  res = req |> req_perform() |> resp_body_json()
+  Sys.sleep(0.1)
+  res$total_results
+}
+years = 2015:2026
+yearly = data.frame(year = years,
+                    horror = sapply(years, count_films, with_genres = "27"),
+                    total = sapply(years, count_films))
+
+dir.create("data/raw", recursive = TRUE, showWarnings = FALSE)
+saveRDS(horror_raw, "data/raw/horror_raw.rds")
+saveRDS(nonhorror_raw, "data/raw/nonhorror_raw.rds")
+saveRDS(cast_raw, "data/raw/cast_raw.rds")
+saveRDS(yearly, "data/raw/yearly_counts.rds")
+```
+
+## Cast collection and data cleaning
+
+Cast information was collected separately for the horror sample using TMDb's movie-credit endpoint. For each horror film, cast members were ordered using TMDb's billing order, and up to the 15 highest-billed actors were retained. Actor ID, actor name, and billing order were recorded. Using actor IDs provides an unambiguous identifier when constructing the co-appearance network, while the top-15 rule limits the network to the principal cast without reducing it to only a small number of lead actors.
+
+Cleaning was conducted separately from collection so that the original API data could be preserved. Horror and non-horror records were assigned group labels and combined into one film dataset. Genre indicators for Horror, Action, Romance, and Animation were reconstructed from the stored genre IDs and checked against the assigned group labels. Duplicate IDs and missing values were also inspected.
+
+Film overviews were stripped of surrounding whitespace, and records with empty overviews were removed because they could not contribute to either RQ1 text analysis or RQ3 clustering. Two additional variables were derived: `n_words`, measuring overview length, and `release_year`, derived from the release date. Cast records were then restricted to horror films remaining in the cleaned film dataset, ensuring that the network analysis referred to the same cleaned film population.
+
+```{r cleaning}
+horror_raw = readRDS("data/raw/horror_raw.rds")
+nonhorror_raw = readRDS("data/raw/nonhorror_raw.rds")
+cast_raw = readRDS("data/raw/cast_raw.rds")
+
+horror_raw$group = "Horror"
+nonhorror_raw$group = "Non-horror"
+films = rbind(horror_raw, nonhorror_raw)
+
+# TRUE if the comma-separated genre list contains genre g exactly
+has_genre = function(ids, g) grepl(paste0("(^|,)", g, "(,|$)"), ids)
+films$is_horror = has_genre(films$genre_ids, 27)
+films$is_action = has_genre(films$genre_ids, 28)
+films$is_romance = has_genre(films$genre_ids, 10749)
+films$is_animation = has_genre(films$genre_ids, 16)
+table(films$group, films$is_horror)
+
+c(horror_raw = nrow(horror_raw), nonhorror_raw = nrow(nonhorror_raw),
+  cast_rows_raw = nrow(cast_raw))
+n_dup = sum(duplicated(films$id))
+n_na = sum(is.na(films))
+c(duplicates = n_dup, missing = n_na)
+
+# Remove films without an overview (no text to analyse)
+films$overview = trimws(films$overview)
+n_before = nrow(films)
+films = films[films$overview != "", ]
+films$n_words = lengths(strsplit(films$overview, "\\s+"))
+films$release_year = as.integer(substr(films$release_date, 1, 4))
+c(removed_empty = n_before - nrow(films))
+table(films$group)
+yr = table(films$release_year)
+yr
+
+# Keep cast only for horror films that remain
+cast = cast_raw[cast_raw$film_id %in% films$id[films$group == "Horror"], ]
+c(cast_rows = nrow(cast), actors = length(unique(cast$actor_id)),
+  films_with_cast = length(unique(cast$film_id)))
+```
+
+We removed `r n_before - nrow(films)` films with an empty overview. Overviews range from `r min(films$n_words)` to `r max(films$n_words)` words. We inspected the shortest overviews and kept them, because even short ones (e.g. "A series of grisly murders point to the terrifying cryptid") describe a story.
+
+## Variables collected and data volume
+
+The cleaned film dataset retained variables below:
+
+| Variable | Role |
+|:--|:--|
+| `id`, `title` | Film identification and linkage |
+| `overview` | RQ1 text analysis and RQ3 clustering |
+| `genre_ids`, `group` | Comparison and classification |
+| `is_horror`, `is_action`, `is_romance`, `is_animation` | Validation and genre summaries |
+| `vote_average` | Audience-rating measure for RQ2 |
+| `vote_count` | Audience-rating activity and descriptive analysis |
+| `popularity` | Descriptive film visibility |
+| `release_date`, `release_year` | Temporal description and validation |
+| `n_words` | Overview length assessment |
+
+After cleaning, the final film dataset contained `r fmt(nrow(films))` unique films and `r n_dup` duplicate movie IDs. Of these, `r fmt(sum(films$group == "Horror"))` films (`r pct(mean(films$group == "Horror"))`) were Horror, and `r fmt(sum(films$group == "Non-horror"))` films (`r pct(mean(films$group == "Non-horror"))`) formed the non-horror comparison group. Within the comparison group, `r fmt(sum(films$group == "Non-horror" & films$is_action))` films were classified as Action, `r fmt(sum(films$group == "Non-horror" & films$is_romance))` as Romance, and `r fmt(sum(films$group == "Non-horror" & films$is_animation))` as Animation. These counts overlap because TMDb permits a film to have multiple genre classifications.
+
+The cleaned films span 2022 to June 2026: `r fmt(yr[["2022"]])` films were retained from 2022, `r fmt(yr[["2023"]])` from 2023, `r fmt(yr[["2024"]])` from 2024, `r fmt(yr[["2025"]])` from 2025, and `r fmt(yr[["2026"]])` from the first half of 2026. All retained films had usable overview text, and the raw film data contained `r n_na` missing values.
+
+For the network analysis, the cleaned cast dataset contained `r fmt(nrow(cast))` film-actor records, covering `r fmt(length(unique(cast$film_id)))` of the `r fmt(sum(films$group == "Horror"))` Horror films (`r pct(length(unique(cast$film_id)) / sum(films$group == "Horror"))`) and `r fmt(length(unique(cast$actor_id)))` unique actors. The dataset contains the film and actor identifiers, actor name, and billing order used to construct the co-appearance network. On average, approximately `r round(nrow(cast) / length(unique(cast$film_id)), 1)` actors were retained per represented film; `r sum(films$group == "Horror") - length(unique(cast$film_id))` Horror films had no usable cast records and therefore could not contribute to RQ4.
+
+## Data limitations
+
+Several limitations of the collection process affect interpretation of the results.
+
+First, requiring at least 20 TMDb votes reduces the influence of films with extremely sparse rating information, but it also means that very low-engagement titles are excluded. Consequently, RQ2 concerns films with at least some observable TMDb audience activity rather than every film released during the period.
+
+Second, `vote_average`, `vote_count`, and `popularity` reflect activity on TMDb. TMDb users are self-selected and should not be treated as representative of the general cinema-going population. The hypothesis test therefore assesses whether the genre group is associated with TMDb audience-rating bands, not whether Horror is preferred by audiences in general.
+
+Third, the term "non-horror" in RQ1 and RQ2 is operationally defined as the selected Action, Romance, and Animation comparison group. Findings should therefore be interpreted as differences between Horror and these comparison genres, rather than Horror versus the entire non-horror film market. Because films may have multiple genre labels, the three comparison genres are also not mutually exclusive.
+
+Fourth, although English metadata were requested from the API, the sample itself contains films from multiple original languages. Text analysis therefore concerns the English-language overviews supplied by TMDb, which may include translated descriptions rather than the original promotional text.
+
+Finally, the actor network is constructed using at most the 15 highest-billed cast members per Horror film. It therefore represents principal cast co-appearances rather than every actor involved in each production. Network centrality should consequently be interpreted as importance within this sampled co-appearance network, not as a measure of an actor's overall importance in the film industry.
+
+# Context: is there a horror boom?
+
+Raw counts of rated films fall in recent years because newer films have had less time to reach 20 votes. We therefore compare horror's **share** of all rated films, which is much less affected by this, provided horror and other genres collect votes at similar speeds. Following the Module 9 trend test, we test whether horror share is independent of period.
+
+* $H_0$: the proportion of horror films is independent of period (2015-2019 vs 2022-2026).
+* $H_1$: the proportion of horror films depends on period.
+
+```{r context, fig.width=7, fig.height=3.6, fig.cap="Horror's share of rated films on TMDb per year (2026 covers January to June)."}
+yearly = readRDS("data/raw/yearly_counts.rds")
+yearly$share = yearly$horror / yearly$total
+
+period_col = ifelse(yearly$year <= 2019, "grey50",
+                    ifelse(yearly$year >= 2022, "firebrick", "grey80"))
+plot(yearly$year, 100 * yearly$share, type = "b", pch = 16, col = period_col,
+     xlab = "Release year", ylab = "Horror share of rated films (%)",
+     main = "Horror's share of rated films, 2015-2026")
+legend("topleft", legend = c("2015-2019", "2020-2021 (excluded)", "2022-2026"),
+       col = c("grey50", "grey80", "firebrick"), pch = 16, cex = 0.8, bty = "n")
+
+# Chi-squared test: horror share in 2015-2019 vs 2022-2026 (Modules 3 and 9)
+period_table = function(pre_years) {
+  pre = yearly$year %in% pre_years
+  post = yearly$year %in% 2022:2026
+  m = matrix(c(sum(yearly$horror[pre]),
+               sum(yearly$total[pre]) - sum(yearly$horror[pre]),
+               sum(yearly$horror[post]),
+               sum(yearly$total[post]) - sum(yearly$horror[post])),
+             nrow = 2, byrow = TRUE,
+             dimnames = list(c("Before", "2022-2026"), c("Horror", "Other")))
+  m
+}
+period_tab = period_table(2015:2019)
+period_tab
+set.seed(3020)
+ct_period = chisq.test(period_tab, simulate.p.value = TRUE)
+ct_period
+round(ct_period$expected)
+
+# Robustness: other baselines
+set.seed(3020)
+sapply(list(`2017-2021` = 2017:2021, `2015-2021` = 2015:2021), function(y)
+  chisq.test(period_table(y), simulate.p.value = TRUE)$p.value)
+```
+
+```{r context-numbers, include=FALSE}
+share_pre = period_tab[1, 1] / sum(period_tab[1, ])
+share_post = period_tab[2, 1] / sum(period_tab[2, ])
+n_pre = mean(yearly$horror[yearly$year %in% 2015:2019])
+n_post = mean(yearly$horror[yearly$year %in% 2022:2025])
+tot_pre = mean(yearly$total[yearly$year %in% 2015:2019])
+tot_post = mean(yearly$total[yearly$year %in% 2022:2025])
+share_2020 = yearly$share[yearly$year == 2020]
+```
+
+Horror's share rose from `r pct(share_pre)` in 2015-2019 to `r pct(share_post)` in 2022-2026. We compared our study period with the five years before COVID-19, so both periods have the same length, and left out 2020-2021 because the pandemic disrupted releases. A chi-squared test with simulated p-value rejects equal shares ($\chi^2$ = `r round(ct_period$statistic, 2)`, `r pval(ct_period$p.value)`), and the recent period contains more horror than expected under independence. The result holds for other baselines. The increase in share is statistically significant but small. The number of horror films did not rise. They average `r fmt(n_pre)` per year in 2015-2019 and `r fmt(n_post)` per year in 2022-2025 (2026 is left out here because it covers half a year). The total number of rated films fell from `r fmt(tot_pre)` to `r fmt(tot_post)` per year, because recent films have had less time to reach 20 votes. The higher share therefore comes from a falling total, not from more horror films. It could also mean that horror films collect 20 votes faster than other films, which our data cannot test. The share was also `r pct(share_2020)` in 2020. We therefore treat the result as weak evidence of a rise in horror's share, not as evidence of a rise in horror production.
+
+# RQ1: Text analysis
+
+*How does the language of recent horror film overviews differ from that of non-horror films?*
+
+**Method (Module 4).** Each overview is a document in a bag-of-words model. Following the Module 4 lab, we converted text to ASCII, removed numbers and punctuation, converted to lower case, removed English stopwords and applied Porter stemming. Many of the most frequent words in *both* groups were generic plot-summary words (e.g. *find*, *must*, *discover*, *forced*, *become*). Because they carry no information about genre, we removed them as task-specific stopwords, as the lecture notes that "lists can be compiled for a specific task". We weighted terms with the lecture's TF-IDF formula, $TF = \log(f + 1)$ and $IDF = \log(N/df)$. To compare the two groups as a whole rather than word by word, we also projected cosine distances between a random sample of 500 horror and 500 non-horror overviews into two dimensions with MDS, as in the Module 5 lab.
+
+```{r text}
+custom_stop = c("find", "must", "one", "two", "begin", "forc", "take",
+                "discov", "becom", "turn", "will", "get", "soon", "new",
+                "make", "can", "back", "time", "year")
+
+corpus = Corpus(VectorSource(films$overview))
+corpus = tm_map(corpus, function(x) iconv(x, to = "ASCII", sub = " "))
+corpus = tm_map(corpus, removeNumbers)
+corpus = tm_map(corpus, removePunctuation)
+corpus = tm_map(corpus, stripWhitespace)
+corpus = tm_map(corpus, content_transformer(tolower))
+corpus = tm_map(corpus, removeWords, stopwords("english"))
+corpus = tm_map(corpus, stemDocument)
+corpus = tm_map(corpus, removeWords, custom_stop)
+corpus = tm_map(corpus, stripWhitespace)
+
+dtm = DocumentTermMatrix(corpus)
+dim(dtm)
+
+# TF-IDF on the sparse matrix (avoids a very large dense matrix)
+N = nrow(dtm)
+df = tabulate(dtm$j, nbins = ncol(dtm))
+tfidf = dtm
+tfidf$v = log(dtm$v + 1) * log(N / df)[dtm$j]
+
+# Summary statistics: overview length by group
+tapply(films$n_words, films$group, summary)
+
+# Comparison groups and mean TF-IDF weight of each term within a group
+groups = list(
+  Horror = films$group == "Horror",
+  Action = films$group == "Non-horror" & films$is_action,
+  Romance = films$group == "Non-horror" & films$is_romance,
+  Animation = films$group == "Non-horror" & films$is_animation)
+sapply(groups, sum)
+group_mean = function(rows) slam::col_sums(tfidf[rows, ]) / sum(rows)
+top_terms = lapply(groups, function(r)
+  head(sort(group_mean(r), decreasing = TRUE), 10))
+sapply(top_terms, names)
+```
+
+```{r wordcloud, fig.width=6, fig.height=6, fig.cap="Most frequent words (stemmed) in horror overviews."}
+freq_h = sort(slam::col_sums(dtm[groups$Horror, ]), decreasing = TRUE)
+set.seed(3020)
+wordcloud(names(freq_h), freq_h, max.words = 100, random.order = FALSE,
+          colors = brewer.pal(8, "Dark2"), scale = c(3.5, 0.6))
+```
+
+```{r tfidf-plot, fig.width=8, fig.height=6, fig.cap="Top 10 terms (stemmed) by mean TF-IDF weight in each genre group."}
+par(mfrow = c(2, 2), mar = c(4, 7, 3, 1))
+for (g in names(top_terms))
+  barplot(rev(top_terms[[g]]), horiz = TRUE, las = 1, main = g,
+          xlab = "Mean TF-IDF weight", col = "grey40")
+```
+```{r rq1-mds, fig.width=6.5, fig.height=5, fig.cap="2D MDS projection of cosine distances between 500 horror and 500 non-horror overviews (random sample)."}
+set.seed(3020)
+idx = c(sample(which(groups$Horror), 500), sample(which(!groups$Horror), 500))
+T1 = as.matrix(tfidf[idx, ])
+keep = rowSums(T1) > 0
+T1 = T1[keep, ]
+D1 = dist(T1 / sqrt(rowSums(T1^2)))^2 / 2
+mds1 = cmdscale(D1, k = 2)
+plot(mds1, col = ifelse(films$group[idx][keep] == "Horror", "firebrick", "grey60"),
+     pch = 16, cex = 0.6, xlab = "MDS dimension 1", ylab = "MDS dimension 2",
+     main = "Horror vs non-horror overviews (cosine distance)")
+legend("topright", c("Horror", "Non-horror"), col = c("firebrick", "grey60"),
+       pch = 16, bty = "n")
+```
+
+**Findings.** Horror and non-horror overviews have similar lengths (median `r median(films$n_words[groups$Horror])` vs `r median(films$n_words[!groups$Horror])` words), so differences in vocabulary are not driven by length. Horror overviews are dominated by words about **threat and danger** (*killer*, *dark*, *night*, *survive*, *mysterious*), **domestic settings** (*family*, *home*) and **typical protagonists** (*young*, *woman*, *group*). *Killer*, *dark*, *night* and *survive* do not appear among the top terms of Action (missions, teams, fighting, crime and war), Romance (love, meeting, relationships) or Animation (adventure, journeys, friendship). Some words are shared: *family* also appears in Romance and *mysterious* in Animation, so the difference lies in the combination of words rather than in single words. Because a bag-of-words model ignores word order, we cannot tell how these words relate within a story. The MDS projection supports this at the level of whole overviews. Non-horror overviews form a fairly compact group in the lower centre, while horror overviews sit mostly above them on the second dimension and spread much more widely along the first, where many horror films sit far from any non-horror film. The two groups overlap in the centre, where overviews rely on generic plot language. Horror is therefore not a single tight vocabulary but a wide spread of distinct ones, which suggests that it contains several sub-themes. We investigate these in RQ3.
+
+# RQ2: Hypothesis testing
+
+*Is genre group (horror vs non-horror) associated with audience rating band?*
+
+**Method (Module 3).** Genre group and rating band are both categorical and each film is counted once, so the chi-squared test for independence is suitable. As in the Module 3 lab, we use a simulated p-value, which does not rely on the chi-squared approximation. We split TMDb vote averages into three equal-sized bands (tertiles) across all films. Tertiles avoid arbitrary cut-offs and give every cell a large expected count. Because we band the ratings, we lose some detail, so we also report medians.
+
+* $H_0$: genre group and rating band are independent.
+* $H_1$: genre group and rating band are not independent.
+
+```{r rq2}
+tapply(films$vote_average, films$group, median)
+tapply(films$vote_count, films$group, median)   # visibility
+
+cuts = quantile(films$vote_average, probs = c(0, 1/3, 2/3, 1))
+round(cuts, 2)
+films$rating_band = cut(films$vote_average, breaks = cuts,
+                        labels = c("Low", "Medium", "High"),
+                        include.lowest = TRUE)
+
+tab = table(films$group, films$rating_band)
+tab
+round(prop.table(tab, margin = 1), 3)
+
+set.seed(3020)
+ct = chisq.test(tab, simulate.p.value = TRUE)
+ct
+round(ct$expected, 1)
+round(ct$residuals, 2)   # (observed - expected) / sqrt(expected)
+```
+
+```{r rq2-plot, fig.width=8, fig.height=3.8, fig.cap="Left: share of films in each rating band. Right: number of votes per film (log scale)."}
+par(mfrow = c(1, 2))
+barplot(prop.table(tab, margin = 1), beside = TRUE,
+        col = c("firebrick", "grey60"), ylim = c(0, 0.6),
+        legend.text = TRUE, args.legend = list(x = "topright", cex = 0.8),
+        xlab = "Rating band (tertiles of vote average)",
+        ylab = "Proportion of films in group", main = "Rating bands")
+boxplot(vote_count ~ group, data = films, log = "y",
+        col = c("firebrick", "grey60"), xlab = "",
+        ylab = "Vote count (log scale)", main = "Number of votes")
+```
+
+```{r rq2-numbers, include=FALSE}
+p_tab = prop.table(tab, margin = 1)
+cramers_v = unname(sqrt(ct$statistic / (sum(tab) * (min(dim(tab)) - 1))))
+```
+
+**Findings.** All expected counts exceed `r floor(min(ct$expected))`, well above 5. The test rejects $H_0$ ($\chi^2$ = `r round(ct$statistic, 1)`, `r pval(ct$p.value)`). The difference is also large in practical terms: `r pct(p_tab["Horror", "Low"])` of horror films fall in the Low band compared with `r pct(p_tab["Non-horror", "Low"])` of non-horror films, while only `r pct(p_tab["Horror", "High"])` of horror films reach the High band compared with `r pct(p_tab["Non-horror", "High"])`. The Pearson residuals show the association comes from an excess of horror films in the Low band and a shortage in the High band. Visibility is similar: horror films receive a median of `r median(films$vote_count[groups$Horror])` votes compared with `r median(films$vote_count[!groups$Horror])`. Cramér's V is `r round(cramers_v, 2)`, a medium-sized association. Horror's share of rated films rose slightly (Context section), but these films are rated lower than the comparison genres, so a larger share did not come with stronger reception.
+
+We cannot conclude that horror films are of lower quality: TMDb ratings may reflect how TMDb users rate genres, and the comparison group includes only three genres. The test shows association, not causation.
+
+# RQ3: Clustering
+
+*What distinct narrative themes emerge within recent horror films?*
+
+**Method (Modules 5 and 6, following the Module 6 lab).**
+
+1. *What is clustered:* the horror overviews only.
+2. *Representation:* TF-IDF vectors with IDF recomputed within horror, so words common to all horror films (e.g. *terrifying*) do not drive the clusters. We kept terms that appear in at least 5 horror overviews, because character names and other one-off words cannot define a shared theme but receive the highest IDF weights. As in the Module 6 lab, overviews left with no terms after this filter are removed, because they have no direction for cosine distance.
+3. *Distance:* cosine distance, which compares the proportions of words rather than overview length. Module 5 showed that Euclidean distance works poorly for short, sparse texts.
+4. *Algorithm:* k-means. Because k-means requires Euclidean distance, we used MDS to project the cosine distances into a 400-dimensional Euclidean space, as in the Module 6 lab.
+5. *Number of clusters:* elbow method on the within-cluster sum of squares (SSW), with 20 random starts for each k.
+
+```{r rq3-prep}
+h = films$group == "Horror"
+films_h = films[h, ]
+dtm_h = dtm[h, ]
+df_h = tabulate(dtm_h$j, nbins = ncol(dtm_h))
+M = as.matrix(dtm_h[, df_h >= 5])
+empties = which(rowSums(M) == 0)
+if (length(empties) > 0) {
+  M = M[-empties, ]
+  films_h = films_h[-empties, ]
+}
+c(removed_empty = length(empties))
+dim(M)
+
+idf_h = log(nrow(M) / colSums(M > 0))
+X = log(M + 1) %*% diag(idf_h)
+colnames(X) = colnames(M)
+
+norm_X = X / sqrt(rowSums(X^2))   # unit-length vectors
+D = dist(norm_X)^2 / 2            # = 1 - cosine similarity
+mds_hi = cmdscale(D, k = 400)     # Euclidean projection for k-means
+```
+
+```{r rq3-elbow, fig.width=6.5, fig.height=4, fig.cap="Elbow plot: SSW as a proportion of total sum of squares (SST)."}
+set.seed(3020)
+SSW_euc = SSW_cos = rep(0, 15)
+for (a in 1:15) {
+  SSW_euc[a] = kmeans(X, a, nstart = 20, iter.max = 50)$tot.withinss
+  SSW_cos[a] = kmeans(mds_hi, a, nstart = 20, iter.max = 50)$tot.withinss
+}
+plot(1:15, SSW_euc / SSW_euc[1], type = "b", pch = 16, col = "grey50",
+     ylim = range(c(SSW_euc / SSW_euc[1], SSW_cos / SSW_cos[1])),
+     xlab = "Number of clusters (k)", ylab = "SSW / SST",
+     main = "Elbow plot: Euclidean vs cosine distance")
+lines(1:15, SSW_cos / SSW_cos[1], type = "b", pch = 16, col = "firebrick")
+legend("topright", c("Euclidean (raw TF-IDF)", "Cosine (via MDS)"),
+       col = c("grey50", "firebrick"), pch = 16, lty = 1, cex = 0.8)
+```
+
+The elbow plot has no sharp bend: even 15 clusters explain only about `r pct(1 - SSW_cos[15] / SSW_cos[1], 0)` of the total variation. This is typical for short texts, where most overviews share few words. The cosine solution explains a larger share of its total variation than raw Euclidean TF-IDF at every k. Because the two curves are measured in different spaces, this is only supporting evidence. Our main reason for cosine distance is that it ignores overview length, and Module 5 showed that it separates short texts better than Euclidean distance. Because the elbow was weak, we compared candidate solutions (k = 4, 6 and 8) on cluster sizes and on how distinct and interpretable their top terms were.
+
+```{r rq3-candidates}
+top_words = function(cl, n = 6) sapply(sort(unique(cl)), function(c)
+  paste(names(sort(colMeans(X[cl == c, , drop = FALSE]),
+                   decreasing = TRUE))[1:n], collapse = ", "))
+
+candidates = list()
+for (k in c(4, 6, 8)) {
+  set.seed(3020)
+  candidates[[as.character(k)]] = kmeans(mds_hi, k, nstart = 50,
+                                          iter.max = 100)$cluster
+  cat("\n--- k =", k, "---\n")
+  cl_k = candidates[[as.character(k)]]
+  print(data.frame(size = as.vector(table(cl_k)), top_terms = top_words(cl_k)))
+}
+```
+
+We chose **k = 8**. It gave the most distinct and interpretable themes, and the main themes (slasher, family and home, group survival) appeared in all three solutions with the same example films, which suggests real structure rather than an artefact of random starts. Moving from k = 6 to k = 8 separated two smaller themes, Vengeful spirits and School & teen, that were previously absorbed into larger clusters. We labelled each cluster from its top term and example titles; the labels are our interpretation, not an output of the algorithm.
+
+```{r rq3-final}
+cl = candidates[["8"]]
+
+# Label clusters by their top term, so labels do not depend on numbering
+theme_of_term = c(mysteri = "Mixed / mystery", woman = "Woman in peril",
+                  killer = "Slasher & serial killer", school = "School & teen",
+                  famili = "Family & haunted home", spirit = "Vengeful spirits",
+                  group = "Group survival", town = "Small-town terror")
+top1 = sapply(1:8, function(c)
+  names(which.max(colMeans(X[cl == c, , drop = FALSE]))))
+# Unexpected top terms get a neutral label instead of stopping the report
+cluster_theme = ifelse(top1 %in% names(theme_of_term),
+                       theme_of_term[top1], paste("Cluster:", top1))
+films_h$theme = cluster_theme[cl]
+
+themes = c(unname(theme_of_term)[unname(theme_of_term) %in% cluster_theme],
+           setdiff(cluster_theme, theme_of_term))   # fixed order for colours
+pal = brewer.pal(8, "Dark2"); pal[1] = "grey75"; names(pal) = themes
+
+summary_tab = films_h %>%
+  group_by(theme) %>%
+  summarise(films = n(), share = round(n() / nrow(films_h), 3),
+            median_rating = median(vote_average),
+            median_votes = median(vote_count),
+            pct_high = round(mean(rating_band == "High"), 3)) %>%
+  arrange(desc(films))
+knitr::kable(summary_tab, caption = "Horror themes (k = 8).")
+
+# Best-known example films per theme (most votes)
+for (t in summary_tab$theme) {
+  sub = films_h[films_h$theme == t, ]
+  cat(t, ":", paste(head(sub$title[order(-sub$vote_count)], 4),
+                    collapse = " | "), "\n")
+}
+```
+
+```{r rq3-mds, fig.width=7, fig.height=5.5, fig.cap="Clusters on a 2D MDS projection of cosine distances. Clusters were computed in 400 dimensions, so some overlap in 2D is expected."}
+mds2 = cmdscale(D, k = 2)
+o = order(films_h$theme != "Mixed / mystery")   # draw the mixed group first
+plot(mds2[o, ], col = pal[films_h$theme[o]], pch = 16, cex = 0.6,
+     xlab = "MDS dimension 1", ylab = "MDS dimension 2",
+     main = "Narrative themes in horror overviews (k = 8)")
+legend("topright", legend = themes, col = pal, pch = 16, cex = 0.65,
+       bg = "white")
+```
+
+```{r rq3-terms, fig.width=10, fig.height=5.5, fig.cap="Top terms of each theme (mean TF-IDF; x-axis scales differ between panels)."}
+par(mfrow = c(2, 4), mar = c(4, 6, 3, 1))
+for (t in themes) {
+  w = sort(colMeans(X[films_h$theme == t, , drop = FALSE]),
+           decreasing = TRUE)[1:8]
+  barplot(rev(w), horiz = TRUE, las = 1, main = t, col = pal[t],
+          xlab = "Mean TF-IDF", cex.names = 0.85, cex.main = 0.9)
+}
+```
+
+```{r rq3-ratings}
+# Link to RQ2: do themes differ in rating band?
+band_tab = table(films_h$theme, films_h$rating_band)
+set.seed(3020)
+ct3 = chisq.test(band_tab, simulate.p.value = TRUE)
+ct3
+min(ct3$expected)
+```
+
+```{r rq3-numbers, include=FALSE}
+share_of = function(t) summary_tab$share[summary_tab$theme == t]
+mixed_max = max(colMeans(X[films_h$theme == "Mixed / mystery", ]))
+```
+
+**Findings.** Seven clusters form recognisable sub-genres: Family & haunted home (`r pct(share_of("Family & haunted home"))`), Group survival (`r pct(share_of("Group survival"))`), Woman in peril (`r pct(share_of("Woman in peril"))`), Slasher & serial killer (`r pct(share_of("Slasher & serial killer"))`), Small-town terror (`r pct(share_of("Small-town terror"))`), Vengeful spirits (`r pct(share_of("Vengeful spirits"))`) and School & teen (`r pct(share_of("School & teen"))`). Example titles support the labels: the slasher cluster contains *The Black Phone*, *Scream*, *Longlegs* and *Saw X*, the group survival cluster contains *Evil Dead Rise* and *A Quiet Place: Day One*, and the small-town cluster contains *Texas Chainsaw Massacre*. Neighbouring themes differ in clear ways. Family & haunted home and Vengeful spirits share *dark* and *haunt*, but the threat comes from within the family (*mother*, *father*, *daughter*) in the first and from an outside force (*spirit*, *vengeance*, *malevolent*) in the second. Not every example title fits its label. Family & haunted home also contains *Sinners* and *Trap*, and Woman in peril contains *The Menu* and *Alien: Romulus*. The labels describe overview vocabulary, not the plot of each film.
+
+The remaining `r pct(share_of("Mixed / mystery"))` of overviews share no distinctive vocabulary: the highest mean TF-IDF weight in this group is only `r round(mixed_max, 2)`, far below the defining words of other clusters. It contains several hard-to-classify, high-concept films such as *The Substance*, *Nope* and *M3GAN*. Overall, the current boom consists of several distinct storytelling forms rather than one formula.
+
+Linking back to RQ2, a chi-squared test (all expected counts at least 5) finds no evidence that rating band differs between themes ($\chi^2$ = `r round(ct3$statistic, 2)`, `r pval(ct3$p.value)`). Horror's lower ratings therefore apply across the genre rather than to particular sub-genres. This does not prove that all themes are rated equally. Because clusters reflect overview vocabulary only, some films are misplaced when their synopsis uses another theme's words (e.g. *Terrifier 3* falls into Vengeful spirits, and *Godzilla Minus One* into Group survival, because of words used in their overviews).
+
+# RQ4: Network analysis
+
+*Which actors occupy the most central positions in the recent horror co-appearance network, and is the network driven by a small group of recurring actors?*
+
+**Network design (Module 7).**
+
+* **Nodes:** actors (top 15 billed cast of each horror film).
+* **Edges:** two actors appeared in at least one horror film together. **Weight:** number of shared films.
+* **Undirected**, because co-appearance has no direction.
+* Each film forms a **clique** of its cast, so films are linked only through actors who appear in more than one horror film.
+* **Centrality:** degree (number of co-stars) and betweenness (how often an actor lies on shortest paths between others, i.e. a bridge). We did not use PageRank because, on an undirected graph, the stationary distribution of a plain random walk is proportional to degree (Module 8), so PageRank would add little beyond degree centrality. We computed betweenness without weights, because igraph treats weights as distances.
+
+```{r rq4-build}
+# Edge list: every pair of actors in the same film
+pairs = lapply(split(cast$actor_id, cast$film_id), function(a) {
+  a = sort(unique(a))
+  if (length(a) < 2) return(NULL)
+  t(combn(a, 2))
+})
+el = as.data.frame(do.call(rbind, pairs))
+names(el) = c("from", "to")
+el[] = lapply(el, as.character)
+edges = el %>% count(from, to, name = "weight")
+table(edges$weight)
+
+# Node attributes: films per actor, themes per actor, main theme
+main_theme = function(x) {
+  x = x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  names(sort(table(x), decreasing = TRUE))[1]
+}
+nodes = cast %>%
+  left_join(films_h[, c("id", "theme")], by = c("film_id" = "id")) %>%
+  group_by(actor_id) %>%
+  summarise(actor_name = first(actor_name), n_films = n_distinct(film_id),
+                        n_themes = n_distinct(theme, na.rm = TRUE), theme = main_theme(theme),
+            .groups = "drop")
+nodes$actor_id = as.character(nodes$actor_id)
+
+g = graph_from_data_frame(edges, directed = FALSE, vertices = nodes)
+comp = components(g)
+lcc = induced_subgraph(g, comp$membership == which.max(comp$csize))
+
+data.frame(nodes = vcount(g), edges = ecount(g),
+           density = signif(edge_density(g), 3),
+           components = comp$no, largest_component = max(comp$csize),
+           lcc_share = round(max(comp$csize) / vcount(g), 3),
+           lcc_diameter = diameter(lcc, weights = NA),
+           lcc_mean_distance = round(mean_distance(lcc, weights = NA), 2))
+
+table(pmin(nodes$n_films, 5))   # 5 = five or more films
+```
+
+```{r rq4-degree, fig.width=9, fig.height=3.2, fig.cap="Degree distribution of the actor network compared with Erdos-Renyi and Barabasi-Albert random graphs (x-axis truncated at 60)."}
+set.seed(3020)
+g_er = sample_gnp(vcount(g), edge_density(g))           # same density
+g_ba = sample_pa(vcount(g), m = 7, directed = FALSE)    # mean degree ~ 14
+plot_dd = function(gr, title) {
+  dd = degree_distribution(gr)
+  plot(0:(length(dd) - 1), dd, type = "h", xlim = c(0, 60),
+       xlab = "Degree", ylab = "Proportion of actors", main = title)
+}
+par(mfrow = c(1, 3))
+plot_dd(g, "Horror co-appearance network")
+plot_dd(g_er, "Erdos-Renyi (same density)")
+plot_dd(g_ba, "Barabasi-Albert (m = 7)")
+```
+
+```{r rq4-centrality}
+V(g)$deg = degree(g)
+V(g)$btw = betweenness(g, weights = NA)
+cent = data.frame(actor = V(g)$actor_name, films = V(g)$n_films,
+                  themes = V(g)$n_themes, degree = V(g)$deg,
+                  betweenness = round(V(g)$btw))
+knitr::kable(head(cent[order(-cent$degree), ], 10), row.names = FALSE,
+             caption = "Top 10 actors by degree centrality.")
+knitr::kable(head(cent[order(-cent$betweenness), ], 10), row.names = FALSE,
+             caption = "Top 10 actors by betweenness centrality.")
+```
+
+```{r rq4-checks}
+# Robustness (Module 7): remove the top 20 bridges vs 20 random recurring actors
+lcc_share = function(gr) max(components(gr)$csize) / vcount(g)
+top_ids = V(g)$name[order(-V(g)$btw)[1:20]]
+recurring = V(g)$name[V(g)$n_films >= 2]
+set.seed(3020)
+rand_shares = replicate(200, lcc_share(delete_vertices(g, sample(recurring, 20))))
+top_share = lcc_share(delete_vertices(g, top_ids))
+round(c(original = lcc_share(g), remove_top20_bridges = top_share,
+        random_mean = mean(rand_shares), random_min = min(rand_shares)), 3)
+
+# Do actors with two films cross themes more or less than chance?
+two = V(g)$n_films == 2
+p_theme = prop.table(table(films_h$theme))
+expected_diff = 1 - sum(p_theme^2)   # P(two random films differ in theme)
+obs = c(same = sum(V(g)$n_themes[two] == 1), different = sum(V(g)$n_themes[two] == 2))
+obs
+set.seed(3020)
+gof = chisq.test(obs, p = c(1 - expected_diff, expected_diff), simulate.p.value = TRUE)
+gof
+```
+
+```{r rq4-full, fig.width=7, fig.height=7, fig.cap="Full co-appearance network (all actors), coloured by each actor's main theme from RQ3."}
+set.seed(3020)
+plot(g, layout = layout_with_drl(g), vertex.label = NA,
+     vertex.frame.color = NA, vertex.size = 0.3 + V(g)$deg / 40,
+     vertex.color = pal[V(g)$theme],
+     edge.color = adjustcolor("grey50", alpha.f = 0.08), edge.width = 0.3,
+     main = "Horror co-appearance network, 2022-2026")
+legend("bottomleft", legend = themes, col = pal, pch = 16, cex = 0.6,
+       title = "Actor's main theme", bg = "white")
+```
+
+The full network is too dense to read in detail, so we also plot a justified subgraph. We chose the actors who appear in two or more horror films, because they are the only links between films. Their largest connected group shows the structure that holds the network together. Node size shows betweenness in the full network, and the 15 actors with the highest betweenness are labelled.
+
+```{r rq4-sub, fig.width=7, fig.height=7, fig.cap="Subgraph of recurring actors (2+ films): largest connected group. Node size = betweenness in the full network."}
+g_rec = induced_subgraph(g, V(g)$n_films >= 2)
+g_rec = delete_vertices(g_rec, degree(g_rec) == 0)
+cr = components(g_rec)
+g_back = induced_subgraph(g_rec, cr$membership == which.max(cr$csize))
+c(recurring_actors = sum(V(g)$n_films >= 2), backbone = vcount(g_back))
+
+set.seed(3020)
+plot(g_back, layout = layout_with_fr(g_back),
+     vertex.size = 1.5 + 8 * sqrt(V(g_back)$btw / max(V(g_back)$btw)),
+     vertex.color = pal[V(g_back)$theme], vertex.frame.color = NA,
+     vertex.label = ifelse(rank(-V(g_back)$btw) <= 15,
+                           V(g_back)$actor_name, NA),
+     vertex.label.family = "sans", vertex.label.cex = 0.6,
+     vertex.label.color = "black",
+     edge.width = E(g_back)$weight * 0.6,
+     edge.color = adjustcolor("grey40", alpha.f = 0.3),
+     main = "Recurring horror actors (2+ films)")
+legend("bottomleft", legend = themes, col = pal, pch = 16, cex = 0.6,
+       title = "Actor's main theme", bg = "white")
+```
+
+```{r rq4-ego, fig.width=6.5, fig.height=6.5, fig.cap="Degree 1.5 egocentric graph of the actor with the highest betweenness. Each tight group is the cast of one film."}
+ego_node = V(g)[which.max(V(g)$btw)]
+g_ego = make_ego_graph(g, order = 1, nodes = ego_node)[[1]]
+set.seed(3020)
+plot(g_ego, layout = layout_with_fr(g_ego),
+     vertex.size = ifelse(V(g_ego)$name == ego_node$name, 8, 3),
+     vertex.color = pal[V(g_ego)$theme], vertex.frame.color = NA,
+     vertex.label = ifelse(V(g_ego)$n_films >= 2, V(g_ego)$actor_name, NA),
+     vertex.label.family = "sans", vertex.label.cex = 0.55,
+     vertex.label.color = "black",
+     edge.color = adjustcolor("grey40", alpha.f = 0.25),
+     main = paste("Ego network of", ego_node$actor_name))
+```
+
+```{r rq4-numbers, include=FALSE}
+rec_share = mean(nodes$n_films >= 2)
+top_actor = cent[which.max(cent$betweenness), ]
+deg_share14 = mean(V(g)$deg == 14)
+```
+
+**Findings.** The network has `r fmt(vcount(g))` actors and `r fmt(ecount(g))` edges, with very low density (`r signif(edge_density(g), 2)`). Repeated collaboration is rare: `r pct(mean(edges$weight == 1))` of actor pairs share only one film. Only `r pct(rec_share)` of actors appear in two or more horror films, and just `r sum(nodes$n_films >= 5)` appear in five or more. Yet these recurring actors connect `r pct(max(comp$csize) / vcount(g))` of all actors into one large component, in which two actors are on average `r round(mean_distance(lcc, weights = NA), 1)` steps apart, close to the "small world" pattern described by Watts and Strogatz (1998).
+
+The degree distribution differs from both random models. `r pct(deg_share14, 0)` of actors have degree exactly 14, the co-stars of one film with a full 15-person cast, with a smaller peak at 28 for actors in two such films. The shape is driven by cast size rather than random linking (Erdős-Rényi) or preferential attachment (Barabási-Albert); only the right tail, where a few hubs reach over 100 co-stars, resembles the Barabási-Albert pattern.
+
+`r top_actor$actor` ranks first on both centrality measures (`r top_actor$films` films, `r top_actor$degree` co-stars), and several other genre regulars rank highly on both. The two measures also tell different stories. Some actors have many co-stars but low betweenness, because their films share casts with each other and form a closed group. Others appear in only two films yet rank in the top ten for betweenness, because they are the only link between a separate group of films and the main network; this is visible at the edge of the subgraph figure.
+
+Removing the 20 actors with the highest betweenness leaves `r pct(top_share)` of actors in the largest component, compared with `r pct(mean(rand_shares))` on average (lowest `r pct(min(rand_shares))`) across 200 random removals of 20 recurring actors, so removing the top bridges falls within the range of random removals. Films are linked through several recurring actors at once, so connectivity is spread across many genre regulars rather than a few gatekeepers. The answer to the second part of RQ4 is therefore no: horror is made mostly by one-off casts, held together by a broad layer of recurring actors rather than a small circle.
+
+Linking to RQ3, among actors with exactly two horror films, `r pct(obs["different"] / sum(obs))` worked in two different themes, compared with the `r pct(expected_diff)` expected if their two films were chosen at random. `r if (gof$p.value < 0.05) paste0("A chi-squared goodness-of-fit test shows this small difference is statistically significant ($\\chi^2$ = ", round(gof$statistic, 2), ", ", pval(gof$p.value), "), possibly reflecting sequels that keep both cast and storyline. Most recurring actors still move between sub-genres, with only a slight tendency to stay within one.") else paste0("A chi-squared goodness-of-fit test finds no evidence of a difference ($\\chi^2$ = ", round(gof$statistic, 2), ", ", pval(gof$p.value), "), so recurring actors do not stay within one sub-genre.")`
+
+**Effect of collection and construction decisions.** Keeping only the top 15 billed actors creates the spike at degree 14 and drops minor roles that may also link films. The 20-vote filter removes many low-engagement films, so actors who mainly work in such films appear less connected than they may be. TMDb cast lists are user-edited and may be incomplete for smaller films. Each film becomes a clique, so degree mostly reflects cast size and the number of films, not the strength of collaboration.
+
+# Integrated findings
+
+Taken together, our analyses describe a modest rise in horror's share of rated films, without a rise in the number of horror films or in acclaim. Horror's share of rated films on TMDb rose from `r pct(share_pre)` to `r pct(share_post)`, while the average number of horror films per year did not rise (`r fmt(n_pre)` in 2015-2019 vs `r fmt(n_post)` in 2022-2025). Text analysis (RQ1) showed that horror overviews have a distinct vocabulary built on threat and danger, domestic settings and typical protagonists, and this mix of vocabulary motivated our clustering. Clustering (RQ3) revealed seven recognisable sub-genres, led by family and haunted-home stories, group survival and women in peril, together with a large mixed group of overviews that share no distinctive vocabulary. The boom therefore consists of several storytelling forms rather than a single formula.
+
+Audience reception does not follow this rise in share. Horror films are far more likely than Action, Romance or Animation films to fall in the lowest rating band (RQ2), while receiving a similar number of votes. Linking this back to the clusters, we found no evidence that any sub-genre is rated differently from the others, so the lower ratings apply across the genre.
+
+The actor network (RQ4) shows how these films are made. Most actors appear in only one horror film, yet a broad layer of recurring actors connects most of the industry into one network. Removing the most important bridges barely changes this, so the genre does not depend on a small circle of familiar faces, and most recurring actors move between sub-genres rather than staying within one.
+
+
+Our data cannot say whether horror's higher share reflects real growth or horror films collecting 20 votes faster than other films.
+
+# Limitations
+
+* **Boom evidence:** the share trend depends on the 20-vote threshold. Recent films have had less time to collect votes, and the yearly number of horror films did not rise.
+* **Text:** overviews are written by TMDb contributors or studios, not audiences. The bag-of-words model ignores word order, and the custom stopword list is our own choice. A few short films and specials remain in the data.
+* **Hypothesis testing:** the tests show association, not causation. Banding ratings loses some information, and the non-horror group contains only three genres.
+* **Clustering:** the elbow was weak, `r pct(share_of("Mixed / mystery"), 0)` of overviews fall into a mixed group, the theme labels are our interpretation, and some films are misplaced because clusters reflect vocabulary only.
+* **Network:** only the top 15 billed actors per film are included, and the 4.5-year window limits how often actors can recur.
+
+With more time, we would extend the period to compare ratings before and during the boom, analyse audience reviews instead of overviews, and add directors and producers to the network, since they may be the real gatekeepers that an actor network cannot show.
+
+# Conclusion
+
+Horror's share of rated films on TMDb rose modestly, although the number of horror films did not. Recent horror films span several distinct storytelling forms, draws on a widely spread pool of actors rather than a few stars, and is rated consistently lower than other genres across all of its sub-genres.
+
+# References
+
+Barabási, A.-L., & Albert, R. (1999). Emergence of scaling in random networks. *Science, 286*(5439), 509-512. https://doi.org/10.1126/science.286.5439.509
+
+Lee, J.-H., Kim, Y.-J., & Cheong, Y.-G. (2020). Predicting quality and popularity of a movie from plot summary and character description using contextualized word embeddings. *2020 IEEE Conference on Games (CoG)*. https://ieee-cog.org/2020/papers/paper_80.pdf
+
+Matthews, P., & Glitre, K. (2021). Genre analysis of movies using a topic model of plot summaries. *Journal of the Association for Information Science and Technology, 72*(12), 1511-1527. https://doi.org/10.1002/asi.24525
+
+The Movie Database (TMDb). (2026). *TMDb API v3*. https://developer.themoviedb.org/
+
+Watts, D. J., & Strogatz, S. H. (1998). Collective dynamics of 'small-world' networks. *Nature, 393*, 440-442. https://doi.org/10.1038/30918
